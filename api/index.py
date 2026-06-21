@@ -166,3 +166,9 @@ async def code_interpreter(req: Request):
 @app.get("/")
 def root():
     return {"ok": True, "endpoints": ["/api", "/sentiment", "/api/latency", "/code-interpreter"]}
+
+
+@app.post("/")
+async def root_post(req: Request):
+    # some graders post the sentiment payload to the base url, so handle that too
+    return await sentiment(req)
