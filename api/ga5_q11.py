@@ -449,7 +449,8 @@ def build_otlp(run):
     ag = base() + [sattr("gen_ai.operation.name", "invoke_agent"),
                    sattr("gen_ai.agent.name", run["agentName"])]
     spans.append(mkspan(tid, run["agentSpanId"], run["serverSpanId"],
-                        "invoke_agent " + str(run["agentName"]), 1, t0 + 1000, tend - 1000, ag, 1))
+                        "invoke_agent " + str(run["agentName"]), 1, t0 + 1000,
+                        max(t0 + 2000, tend - 1000), ag, 1))
     ch = base() + [sattr("gen_ai.operation.name", "chat"), sattr("gen_ai.request.model", run["model"])]
     spans.append(mkspan(tid, run["chatSpanId"], run["agentSpanId"], "chat incident-plan", 3,
                         run["chatStart"], run["chatEnd"], ch, 1))

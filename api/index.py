@@ -417,12 +417,25 @@ from urllib.parse import urlsplit, unquote
 
 # the three big agent questions live in their own modules. never let one bad
 # import take the whole app down - the other endpoints must stay servable.
+# vercel does not reliably put the handler's own dir on sys.path, so force it.
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+_MOUNT_ERRORS = {}
 for _mod in ("ga5_q9", "ga5_q10", "ga5_q11"):
     try:
-        _m = __import__(_mod)
+        import importlib
+        _m = importlib.import_module(_mod)
         app.include_router(_m.router)
+        _MOUNT_ERRORS[_mod] = "mounted"
     except Exception as _e:
+        _MOUNT_ERRORS[_mod] = "%s: %s" % (type(_e).__name__, _e)
         print("WARN: could not mount %s: %r" % (_mod, _e))
+
+
+@app.get("/_mounts")
+def _mounts():
+    return {"mounts": _MOUNT_ERRORS,
+            "routes": sorted({getattr(r, "path", "") for r in app.routes})}
 
 EMAIL = "22f2000667@ds.study.iitm.ac.in"
 
