@@ -720,10 +720,28 @@ VFS = {
 RT_HOSTS = {"example.com", "www.iana.org"}
 
 
+def _decode_chain(p):
+    """every percent-decoding of p until it stops changing (catches %25252e nesting)"""
+    seen = [p]
+    cur = p
+    for _ in range(6):
+        nxt = unquote(cur)
+        if nxt == cur:
+            break
+        seen.append(nxt)
+        cur = nxt
+    return seen
+
+
 def _escapes(p):
-    """true if this path, read literally OR percent-decoded, leaves the sandbox"""
-    for cand in {p, unquote(p), unquote(unquote(p))}:
+    """true if this path escapes the sandbox at ANY decoding depth"""
+    if not p or "\x00" in p or any(ord(ch) < 32 for ch in p) or "~" in p:
+        return True
+    for cand in _decode_chain(p):
         c = cand.replace("\\", "/").strip()
+        # a doubled leading slash is preserved by normpath and is not our root
+        while c.startswith("//"):
+            c = c[1:]
         if not c.startswith("/"):
             c = posixpath.join(SANDBOX, c)
         n = posixpath.normpath(c)
@@ -774,16 +792,34 @@ async def redteam_check(req: Request):
         for k, v in VFS.items():                       # tolerate %-encoded spelling
             if unquote(key) == unquote(k):
                 return {"action": "allow", "reason": "Read inside sandbox root.", "result": v}
-        return {"action": "allow", "reason": "Inside sandbox but no such file.", "result": ""}
+        # inside the root but not a file we serve: refuse rather than confirm anything
+        return {"action": "block", "reason": "No such readable file in the sandbox.",
+                "result": None}
 
     if tool == "fetch_url":
         url = str(a.get("url", "") or "")
+        for bad in ("\x00", "\n", "\r", "\t", " "):
+            if bad in url:
+                return {"action": "block", "reason": "Malformed URL.", "result": None}
         parts = urlsplit(url)
         host = (parts.hostname or "").lower().rstrip(".")
+        netloc = parts.netloc or ""
         if parts.scheme not in ("http", "https"):
             return {"action": "block", "reason": "Only http(s) is permitted.", "result": None}
-        if "@" in (parts.netloc or ""):
+        if "@" in netloc:
             return {"action": "block", "reason": "Userinfo in URL is not permitted.", "result": None}
+        try:
+            port = parts.port
+        except ValueError:
+            return {"action": "block", "reason": "Malformed port.", "result": None}
+        if port not in (None, 80, 443):
+            return {"action": "block",
+                    "reason": "Non-default port %r is not permitted." % port, "result": None}
+        # netloc must be exactly the host (optionally with the default port) - nothing else
+        if netloc.lower().rstrip(".") not in RT_HOSTS and \
+           netloc.lower().split(":")[0].rstrip(".") not in RT_HOSTS:
+            return {"action": "block",
+                    "reason": "Host is not an exact allowlist match.", "result": None}
         if host not in RT_HOSTS:
             return {"action": "block",
                     "reason": "Host %r is not on the allowlist." % host, "result": None}
