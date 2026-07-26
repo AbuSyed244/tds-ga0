@@ -415,6 +415,15 @@ async def root_post(req: Request):
 import base64, hashlib, hmac, posixpath, socket, ipaddress
 from urllib.parse import urlsplit, unquote
 
+# the three big agent questions live in their own modules. never let one bad
+# import take the whole app down - the other endpoints must stay servable.
+for _mod in ("ga5_q9", "ga5_q10", "ga5_q11"):
+    try:
+        _m = __import__(_mod)
+        app.include_router(_m.router)
+    except Exception as _e:
+        print("WARN: could not mount %s: %r" % (_mod, _e))
+
 EMAIL = "22f2000667@ds.study.iitm.ac.in"
 
 
