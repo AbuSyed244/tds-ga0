@@ -514,6 +514,7 @@ QUAR_REASON = {
     "tool_control": "tool_control_attempt",
     "unauthorized_outbound": "unapproved_send_request",
     "private_data_exfiltration": "data_exfiltration_attempt",
+    "model_quarantine": "untrusted_content",
 }
 
 
@@ -783,8 +784,10 @@ async def do_propose(body):
             if hit:
                 want, ev, margs = hit
                 args = merge_args(args, margs, lines)
-                # safety clamps, the model never gets to loosen a quarantine or
-                # invent an outbound send that nobody approved
+                asked = want
+                # safety clamps. a quarantine can only soften into another
+                # harmless action, never into a send or a record write, and the
+                # model can never invent an outbound send nobody approved.
                 if action == "quarantine_item" and want in (
                         "send_approved_notice", "update_internal_record", "no_action"):
                     want = "quarantine_item"
@@ -795,15 +798,30 @@ async def do_propose(body):
                     if want != action:
                         action = want
                         if want == "quarantine_item":
-                            reason = "instruction_override"
+                            reason = "model_quarantine"
                         elif want == "no_action":
                             reason = "duplicate_or_informational"
                         else:
                             reason = "model_triage"
-                    if ev:
+                    # only trust the model's citations when we kept the model's
+                    # answer. a clamped answer keeps the evidence the rules found.
+                    if ev and want == asked:
                         evidence = ev
             if action not in allowed:
                 action = "no_action" if "no_action" in allowed else allowed[0]
+            # a send or a record write must cite the trusted lines that carry
+            # the authority and the exact arguments, nothing else
+            if action == "send_approved_notice":
+                pri = [arg_line(args, "approvalId"), arg_line(args, "recipient"),
+                       arg_line(args, "template")]
+            elif action == "update_internal_record":
+                pri = [arg_line(args, "record"), arg_line(args, "field"),
+                       arg_line(args, "value")]
+            else:
+                pri = []
+            pri = [x for x in pri if x]
+            if pri:
+                evidence = pri
 
         # evidence has to be unique line ids that really exist in this dossier
         valid = {ln["id"] for ln in lines}
