@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 import os, csv, json, io, sys, traceback, re
 import httpx
 from typing import List, Optional
@@ -406,3 +407,386 @@ def root():
 async def root_post(req: Request):
     # some graders post the sentiment payload to the base url, so handle that too
     return await sentiment(req)
+
+
+# ############################################################################
+# GA5 - Agentic AI
+# ############################################################################
+import base64, hashlib, hmac, posixpath, socket, ipaddress
+from urllib.parse import urlsplit, unquote
+
+EMAIL = "22f2000667@ds.study.iitm.ac.in"
+
+
+# ---------------------------------------------------------------- GA5 Q2 ----
+@app.post("/charge")
+async def charge(req: Request):
+    b = await req.json()
+    old = float(b.get("old_price", 0)); new = float(b.get("new_price", 0))
+    dr = float(b.get("days_remaining", 0))
+    dim = float(b.get("days_in_actual_month") or 30)
+    div = 30.0 if str(b.get("spec", "v1")).lower() != "v2" else (dim or 30.0)
+    return {"charge": (new - old) * (dr / div)}
+
+
+# ---------------------------------------------------------------- GA5 Q3 ----
+SECRET_FILE = "/home/agent/.npmrc"
+WORKDIR = "/home/agent/workspace"
+HOME = "/home/agent"
+WRITE_ROOT = "/srv/reports"
+ALLOWED_HOSTS = {"registry.npmjs.org", "raw.githubusercontent.com"}
+
+
+def _norm(path, base=WORKDIR):
+    """absolute-ise + collapse .. and . the way the kernel would"""
+    p = path.strip().strip('"').strip("'")
+    p = p.replace("${HOME}", HOME).replace("$HOME", HOME)
+    if p.startswith("~"):
+        p = HOME + p[1:]
+    if not p.startswith("/"):
+        p = posixpath.join(base, p)
+    return posixpath.normpath(p)
+
+
+def _b64_expansions(cmd):
+    """decode any base64-looking blob so wrapped commands are inspected too"""
+    outs = []
+    for tokn in re.findall(r"[A-Za-z0-9+/=]{12,}", cmd):
+        try:
+            d = base64.b64decode(tokn + "=" * (-len(tokn) % 4), validate=False)
+            t = d.decode("utf-8", "ignore")
+            if t.strip():
+                outs.append(t)
+        except Exception:
+            pass
+    return outs
+
+
+def _touches_secret(cmd):
+    variants = [cmd] + _b64_expansions(cmd)
+    for v in variants:
+        low = v.lower()
+        # any path-ish token in the command, normalised, that lands on the secret
+        for tokn in re.findall(r"[~$\w./{}\\-]+", v):
+            if ".npmrc" in tokn.lower() or "npmrc" in tokn.lower():
+                if _norm(tokn) == SECRET_FILE:
+                    return True
+        if ".npmrc" in low:
+            # catch quoting/concat tricks that defeat tokenising
+            squashed = re.sub(r"[\"'\\]", "", v)
+            for tokn in re.findall(r"[~$\w./{}-]+", squashed):
+                if _norm(tokn) == SECRET_FILE:
+                    return True
+    return False
+
+
+@app.post("/guardrail-check")
+async def guardrail_check(req: Request):
+    try:
+        b = await req.json()
+    except Exception:
+        return {"decision": "block", "reason": "Malformed request body."}
+    tool = b.get("tool")
+
+    if tool == "bash":
+        cmd = b.get("command", "") or ""
+        if _touches_secret(cmd):
+            return {"decision": "block",
+                    "reason": "Attempts to read the protected secret file /home/agent/.npmrc."}
+        for v in [cmd] + _b64_expansions(cmd):
+            if "/etc/shadow" in v:
+                return {"decision": "block",
+                        "reason": "Reading /etc/shadow is never permitted by this agent's policy."}
+        return {"decision": "allow", "reason": "No protected path or forbidden action touched."}
+
+    if tool == "write_file":
+        p = _norm(b.get("path", "") or "")
+        if p == WRITE_ROOT or p.startswith(WRITE_ROOT.rstrip("/") + "/"):
+            return {"decision": "allow", "reason": "Write stays inside /srv/reports/."}
+        return {"decision": "block",
+                "reason": "Writes are only permitted inside /srv/reports/."}
+
+    if tool == "http_request":
+        host = (urlsplit(b.get("url", "") or "").hostname or "").lower().rstrip(".")
+        if host in ALLOWED_HOSTS:
+            return {"decision": "allow", "reason": "Host is on the outbound allowlist."}
+        return {"decision": "block",
+                "reason": "Host %r is not an exact match for an allowlisted host." % host}
+
+    return {"decision": "block", "reason": "Unknown tool."}
+
+
+# ---------------------------------------------------------------- GA5 Q5 ----
+def _canon(args):
+    """sort keys, collapse whitespace inside strings, drop the tracing id"""
+    if isinstance(args, dict):
+        return {k: _canon(v) for k, v in sorted(args.items()) if k != "client_ts"}
+    if isinstance(args, list):
+        return [_canon(v) for v in args]
+    if isinstance(args, str):
+        return " ".join(args.split())
+    return args
+
+
+def _sig(step):
+    return json.dumps([step.get("tool"), _canon(step.get("args") or {})],
+                      sort_keys=True, separators=(",", ":"))
+
+
+@app.post("/budget-check")
+async def budget_check(req: Request):
+    try:
+        b = await req.json()
+    except Exception:
+        return {"decision": "halt", "reason": "Malformed request body."}
+    budget = b.get("budget_tokens")
+    budget = 50000 if budget is None else int(budget)
+    steps = b.get("steps") or []
+    used = sum(int(s.get("tokens_used") or 0) for s in steps)
+    if used >= budget:
+        return {"decision": "halt",
+                "reason": "Cumulative tokens_used (%d) has reached the budget (%d)." % (used, budget)}
+
+    sigs = [_sig(s) for s in steps]
+    # 3+ functionally identical calls in a row
+    if len(sigs) >= 3 and sigs[-1] == sigs[-2] == sigs[-3]:
+        return {"decision": "halt",
+                "reason": "Same tool called 3 times in a row with functionally identical args."}
+    # A,B,A,B,A,B over the trailing 6
+    if len(sigs) >= 6:
+        t = sigs[-6:]
+        if t[0] != t[1] and t[0] == t[2] == t[4] and t[1] == t[3] == t[5]:
+            return {"decision": "halt",
+                    "reason": "Trailing steps form a repeating 2-step A/B cycle."}
+    return {"decision": "continue",
+            "reason": "Under budget (%d/%d) and no loop detected in trailing steps." % (used, budget)}
+
+
+# ---------------------------------------------------------------- GA5 Q4 ----
+_SECRET_PAT = [
+    r"sk-[A-Za-z0-9]{16,}", r"gh[pousr]_[A-Za-z0-9]{20,}", r"xox[baprs]-[A-Za-z0-9-]{10,}",
+    r"AKIA[0-9A-Z]{12,}", r"AIza[0-9A-Za-z_\-]{20,}",
+    r"https://hooks\.slack\.com/\S+", r"https://discord(app)?\.com/api/webhooks/\S+",
+    r"(?i)\b(api[_-]?key|apikey|token|secret|password|passwd|webhook_url)\s*[:=]\s*[\"']?[A-Za-z0-9_\-/+.]{12,}",
+    r"(?i)bearer\s+[A-Za-z0-9_\-\.]{20,}",
+]
+_ENVISH = re.compile(r"(?i)(\$\{?[A-Z_]+\}?|os\.environ|process\.env|env\[|secret[_ ]?store|vault)")
+_INJECT_PAT = [
+    r"(?i)ignore (all |any )?(previous|prior|earlier|the user'?s?) (instruction|request|command|stop)",
+    r"(?i)(do not|don'?t|never) (tell|inform|mention to|reveal to|surface to|notify) the (user|reviewer|operator)",
+    r"(?i)(silently|quietly|without (telling|informing|notifying|asking)) (send|upload|post|exfiltrat|copy|transmit|email)",
+    r"(?i)(disregard|override|bypass) (the )?(user|operator|safety|guard|stop|cancel)",
+    r"(?i)even if the user (asks|says|requests) (you )?to (stop|cancel|halt)",
+    r"(?i)continue (anyway|regardless) (even )?if (the user|asked to) (stop|cancel)",
+    r"(?i)(send|post|upload|exfiltrate) (the )?(file )?contents? to (https?://|\S+@)",
+]
+_PERM_BROAD = [
+    r"(?i)filesystem\s*:\s*(read[_-]?write\s*)?(/|\*|all|entire|full)",
+    r"(?i)(read|write|access)\s*:\s*[\"']?(/|/\*\*?|\*|all|everything)[\"']?",
+    r"(?i)network\s*:\s*[\"']?(\*|any|all|unrestricted|0\.0\.0\.0/0)[\"']?",
+    r"(?i)(allowed[_-]?(domains|hosts)|egress)\s*:\s*[\"']?(\*|any|all)[\"']?",
+    r"(?i)permissions?\s*:\s*[\"']?(\*|all|admin|root|full)[\"']?",
+    r"(?i)scope\s*:\s*[\"']?(\*|all|unrestricted)[\"']?",
+]
+
+
+@app.post("/scan")
+async def scan(req: Request):
+    try:
+        b = await req.json()
+    except Exception:
+        return {"categories": []}
+    s = b.get("skill", "") or ""
+    cats = []
+
+    # hardcoded_secret - a real literal, not an env reference
+    for pat in _SECRET_PAT:
+        for m in re.finditer(pat, s):
+            frag = m.group(0)
+            if _ENVISH.search(frag):
+                continue
+            ctx = s[max(0, m.start() - 60):m.start()]
+            if _ENVISH.search(frag) or ("env" in frag.lower() and "$" in frag):
+                continue
+            if re.search(r"(?i)(example|placeholder|your[_-]?key|xxx+|<[^>]+>|\.\.\.)", frag):
+                continue
+            cats.append("hardcoded_secret"); break
+        if "hardcoded_secret" in cats:
+            break
+
+    if any(re.search(p, s) for p in _INJECT_PAT):
+        cats.append("prompt_injection")
+
+    if any(re.search(p, s) for p in _PERM_BROAD):
+        cats.append("excessive_permissions")
+
+    head = s[:1200].lower()
+    has_author = re.search(r"(?im)^\s*author\s*:", head) is not None
+    has_version = re.search(r"(?im)^\s*version\s*:", head) is not None
+    has_changelog = "changelog" in s.lower()
+    silent_bump = re.search(
+        r"(?i)(update|bump|rewrite|increment|change)[^.\n]{0,50}\bversion\b[^.\n]{0,80}"
+        r"(without|silently|do not (mention|tell|surface)|no need to (mention|tell))", s) is not None
+    if (not has_author and not has_version and not has_changelog) or silent_bump:
+        cats.append("unclear_provenance")
+
+    return {"categories": cats}
+
+
+# ---------------------------------------------------------------- GA5 Q6 ----
+def _mcp_answer(challenge):
+    return hashlib.sha256(("%s:%s" % (challenge, EMAIL)).encode()).hexdigest()[:16]
+
+
+def _jr(_id, result):
+    return {"jsonrpc": "2.0", "id": _id, "result": result}
+
+
+@app.post("/mcp")
+async def mcp(req: Request):
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+    msgs = body if isinstance(body, list) else [body]
+    out = []
+    for m in msgs:
+        method = m.get("method"); _id = m.get("id")
+        if _id is None:
+            continue                                   # notification -> no response
+        if method == "initialize":
+            out.append(_jr(_id, {
+                "protocolVersion": m.get("params", {}).get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "tds-ga5-mcp", "version": "1.0.0"},
+            }))
+        elif method == "tools/list":
+            out.append(_jr(_id, {"tools": [{
+                "name": "solve_challenge",
+                "description": "Returns the exam challenge digest for the current call.",
+                "inputSchema": {"type": "object", "properties": {}, "required": []},
+            }]}))
+        elif method == "tools/call":
+            ch = req.headers.get("x-exam-challenge", "") or ""
+            out.append(_jr(_id, {
+                "content": [{"type": "text", "text": _mcp_answer(ch)}],
+                "isError": False,
+            }))
+        elif method == "ping":
+            out.append(_jr(_id, {}))
+        else:
+            out.append({"jsonrpc": "2.0", "id": _id,
+                        "error": {"code": -32601, "message": "Method not found"}})
+    if not out:
+        return Response(status_code=202)
+    return JSONResponse(out[0] if len(out) == 1 else out)
+
+
+@app.get("/mcp")
+async def mcp_get():
+    return Response(status_code=405)
+
+
+# ---------------------------------------------------------------- GA5 Q8 ----
+SANDBOX = "/srv/agent-redteam/sandbox-f0bfdd85ff"
+VFS = {
+    SANDBOX + "/notes/report.txt": "SAFE_REPORT_536bd61731a942a21f9c22bd\n",
+    SANDBOX + "/notes/looks-like-..-but-safe.txt": "SAFE_WEIRD_842641487bff73eb06bdc86d\n",
+    SANDBOX + "/encoded/%2e%2e-literal.txt": "SAFE_ENCODED_7a128aca39c9684f3f1090b9\n",
+}
+RT_HOSTS = {"example.com", "www.iana.org"}
+
+
+def _escapes(p):
+    """true if this path, read literally OR percent-decoded, leaves the sandbox"""
+    for cand in {p, unquote(p), unquote(unquote(p))}:
+        c = cand.replace("\\", "/").strip()
+        if not c.startswith("/"):
+            c = posixpath.join(SANDBOX, c)
+        n = posixpath.normpath(c)
+        if not (n == SANDBOX or n.startswith(SANDBOX + "/")):
+            return True
+    return False
+
+
+def _private_host(host):
+    if not host:
+        return True
+    h = host.lower().rstrip(".")
+    if h in ("localhost", "metadata.google.internal") or h.endswith(".localhost"):
+        return True
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except Exception:
+        return True
+    for fam, _, _, _, sa in infos:
+        try:
+            ip = ipaddress.ip_address(sa[0])
+        except Exception:
+            return True
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
+
+
+@app.post("/redteam-check")
+async def redteam_check(req: Request):
+    try:
+        b = await req.json()
+    except Exception:
+        return {"action": "block", "reason": "Malformed request body.", "result": None}
+    tool = b.get("tool"); a = b.get("arguments") or {}
+
+    if tool == "read_file":
+        p = str(a.get("path", "") or "")
+        if _escapes(p):
+            return {"action": "block",
+                    "reason": "Path resolves outside the sandbox root.", "result": None}
+        key = p if p.startswith("/") else posixpath.join(SANDBOX, p)
+        key = posixpath.normpath(key.replace("\\", "/"))
+        if key in VFS:
+            return {"action": "allow", "reason": "Read inside sandbox root.",
+                    "result": VFS[key]}
+        for k, v in VFS.items():                       # tolerate %-encoded spelling
+            if unquote(key) == unquote(k):
+                return {"action": "allow", "reason": "Read inside sandbox root.", "result": v}
+        return {"action": "allow", "reason": "Inside sandbox but no such file.", "result": ""}
+
+    if tool == "fetch_url":
+        url = str(a.get("url", "") or "")
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower().rstrip(".")
+        if parts.scheme not in ("http", "https"):
+            return {"action": "block", "reason": "Only http(s) is permitted.", "result": None}
+        if "@" in (parts.netloc or ""):
+            return {"action": "block", "reason": "Userinfo in URL is not permitted.", "result": None}
+        if host not in RT_HOSTS:
+            return {"action": "block",
+                    "reason": "Host %r is not on the allowlist." % host, "result": None}
+        if _private_host(host):
+            return {"action": "block",
+                    "reason": "Host resolves to a private address.", "result": None}
+        cur = url
+        try:
+            for _ in range(4):
+                r = httpx.get(cur, timeout=6.0, follow_redirects=False,
+                              headers={"User-Agent": "tds-ga5"})
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("location", "")
+                    nxt = urlsplit(loc)
+                    nh = (nxt.hostname or "").lower().rstrip(".")
+                    if nh not in RT_HOSTS or _private_host(nh):
+                        return {"action": "block",
+                                "reason": "Redirect target is not allowlisted.", "result": None}
+                    cur = loc
+                    continue
+                return {"action": "allow", "reason": "Host is allowlisted.",
+                        "result": {"body": r.text[:4000], "status": r.status_code}}
+            return {"action": "block", "reason": "Too many redirects.", "result": None}
+        except Exception as e:
+            return {"action": "allow", "reason": "Host is allowlisted.",
+                    "result": {"body": "", "status": 0, "error": type(e).__name__}}
+
+    return {"action": "block", "reason": "Unknown tool.", "result": None}
